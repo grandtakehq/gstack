@@ -210,6 +210,26 @@ no middle mode). See `docs/designs/PLAN_TUNING_V1.md` for the full design
 rationale. The review pacing overhaul that originally tried to ride alongside
 writing-style was extracted to V1.1 — see `docs/designs/PACING_UPDATES_V0.md`.
 
+## Website questions (paste-a-link)
+
+When the user pastes a URL and asks about the site ("what payment methods
+work here?", "why won't my payment go through?", "what is this site?",
+"what does this page say about X?"), run `bin/gstack-site-inspect` instead of
+answering from memory:
+
+```bash
+bin/gstack-site-inspect <url>                 # payment processors, methods, currencies, region rules, checkout links, forms
+bin/gstack-site-inspect <url> --json          # same, machine-readable
+bin/gstack-site-inspect text <url>            # full rendered text, for any other question about the page
+bin/gstack-site-inspect scrape <url> --item CSS --field name=CSS[@attr] [--next CSS] --out file.csv
+```
+
+If the homepage shows no payment signals, re-run on the checkout/cart/pricing
+links the report lists. Answer from the report's evidence, and say plainly that
+a decline can also come from the bank, fraud rules, 3-D Secure, or card
+country, which no public page reveals. Read-only: never submit forms or attempt
+a payment. Logic lives in `lib/site-inspect.ts` (tests: `test/site-inspect.test.ts`).
+
 ## Browser interaction
 
 When you need to interact with a browser (QA, dogfooding, cookie setup), use the
