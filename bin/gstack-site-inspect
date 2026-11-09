@@ -1,0 +1,243 @@
+#!/usr/bin/env bun
+/**
+ * gstack-site-inspect — paste a link, learn what the site is and how it takes payment.
+ *
+ * Usage:
+ *   gstack-site-inspect <url> [--json] [--out FILE] [--wait MS] [--timeout MS] [--headed]
+ *       Load the page in headless Chromium (JS runs), then report: payment
+ *       processors, payment methods shown, currencies, region/billing
+ *       restrictions, checkout links, and forms. --json for machine output.
+ *
+ *   gstack-site-inspect text <url> [--out FILE]
+ *       Dump the rendered page's readable text (for asking questions about it).
+ *
+ *   gstack-site-inspect scrape <url> --item CSS --field name=CSS[@attr] [--field ...]
+ *                              [--next CSS] [--max-pages N] [--out FILE.csv]
+ *       Generic CSV scraper. One row per --item match; each --field is read
+ *       relative to the item (textContent, or the attribute after @).
+ *       --next follows a "next page" link/button up to --max-pages (default 5).
+ *       Without --item, each --field yields one column of all matches page-wide.
+ *
+ * Read-only: never submits forms or clicks anything except --next.
+ * Respects HTTPS_PROXY (credentials split out for Chromium).
+ *
+ * Exit codes: 0 ok, 1 usage error, 2 page failed to load.
+ */
+import { writeFileSync } from 'fs';
+import { chromium, type Browser, type Page } from 'playwright';
+import {
+  analyzeSnapshot, formatReport, toCsv, parseFieldSpec, type PageSnapshot,
+} from '../lib/site-inspect';
+
+interface Opts {
+  mode: 'inspect' | 'text' | 'scrape';
+  url: string;
+  json: boolean;
+  out: string | null;
+  wait: number;
+  timeout: number;
+  headed: boolean;
+  item: string | null;
+  fields: string[];
+  next: string | null;
+  maxPages: number;
+}
+
+function usage(msg?: string): never {
+  if (msg) console.error(`error: ${msg}\n`);
+  console.error([
+    'usage:',
+    '  gstack-site-inspect <url> [--json] [--out FILE]',
+    '  gstack-site-inspect text <url> [--out FILE]',
+    '  gstack-site-inspect scrape <url> --item CSS --field name=CSS[@attr] ... [--next CSS] [--max-pages N] [--out FILE.csv]',
+  ].join('\n'));
+  process.exit(1);
+}
+
+function parseArgs(argv: string[]): Opts {
+  const o: Opts = {
+    mode: 'inspect', url: '', json: false, out: null, wait: 1500, timeout: 45000,
+    headed: false, item: null, fields: [], next: null, maxPages: 5,
+  };
+  const rest = [...argv];
+  if (rest[0] === 'scrape' || rest[0] === 'text' || rest[0] === 'inspect') o.mode = rest.shift() as Opts['mode'];
+  const val = (flag: string) => {
+    const v = rest.shift();
+    if (v === undefined) usage(`${flag} needs a value`);
+    return v;
+  };
+  while (rest.length) {
+    const a = rest.shift()!;
+    switch (a) {
+      case '--json': o.json = true; break;
+      case '--headed': o.headed = true; break;
+      case '--out': o.out = val(a); break;
+      case '--wait': o.wait = Number(val(a)); break;
+      case '--timeout': o.timeout = Number(val(a)); break;
+      case '--item': o.item = val(a); break;
+      case '--field': o.fields.push(val(a)); break;
+      case '--next': o.next = val(a); break;
+      case '--max-pages': o.maxPages = Number(val(a)); break;
+      case '-h': case '--help': usage();
+      default:
+        if (a.startsWith('--')) usage(`unknown flag ${a}`);
+        if (o.url) usage(`unexpected argument ${a}`);
+        o.url = a;
+    }
+  }
+  if (!o.url) usage('missing url');
+  if (!/^https?:\/\//i.test(o.url)) o.url = `https://${o.url}`;
+  if (o.mode === 'scrape' && o.fields.length === 0) usage('scrape needs at least one --field');
+  return o;
+}
+
+function proxyConfig(): { server: string; username?: string; password?: string; bypass?: string } | undefined {
+  const raw = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+  if (!raw) return undefined;
+  const u = new URL(raw);
+  const cfg: { server: string; username?: string; password?: string; bypass?: string } = { server: `${u.protocol}//${u.host}` };
+  if (u.username) cfg.username = decodeURIComponent(u.username);
+  if (u.password) cfg.password = decodeURIComponent(u.password);
+  const noProxy = process.env.NO_PROXY || process.env.no_proxy;
+  if (noProxy) cfg.bypass = noProxy;
+  return cfg;
+}
+
+async function openPage(o: Opts): Promise<{ browser: Browser; page: Page; status: number | null; requests: string[] }> {
+  const browser = await chromium.launch({ headless: !o.headed, proxy: proxyConfig() });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36 gstack-site-inspect',
+    viewport: { width: 1366, height: 900 },
+  });
+  const page = await context.newPage();
+  const requests: string[] = [];
+  page.on('request', r => { if (requests.length < 2000) requests.push(r.url()); });
+  let status: number | null = null;
+  try {
+    const resp = await page.goto(o.url, { waitUntil: 'domcontentloaded', timeout: o.timeout });
+    status = resp?.status() ?? null;
+  } catch (err) {
+    await browser.close();
+    console.error(`error: could not load ${o.url}: ${(err as Error).message.split('\n')[0]}`);
+    process.exit(2);
+  }
+  await page.waitForLoadState('networkidle', { timeout: Math.min(o.timeout, 15000) }).catch(() => {});
+  if (o.wait > 0) await page.waitForTimeout(o.wait);
+  return { browser, page, status, requests };
+}
+
+async function snapshot(page: Page, url: string, status: number | null, requests: string[]): Promise<PageSnapshot> {
+  const data = await page.evaluate(() => {
+    const abs = (u: string | null) => { try { return u ? new URL(u, location.href).href : ''; } catch { return ''; } };
+    const labelFor = (el: Element): string => {
+      const id = el.getAttribute('id');
+      const byFor = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+      const wrap = el.closest('label');
+      return ((byFor || wrap)?.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    };
+    return {
+      finalUrl: location.href,
+      title: document.title,
+      description: document.querySelector('meta[name="description"],meta[property="og:description"]')?.getAttribute('content') || '',
+      lang: document.documentElement.lang || '',
+      text: (document.body?.innerText || '').slice(0, 200000),
+      images: [...document.querySelectorAll('img, svg[aria-label], [class*="payment"] *, [class*="card-icon"]')].slice(0, 800).map(el => ({
+        src: el instanceof HTMLImageElement ? el.currentSrc || el.src : '',
+        alt: el.getAttribute('alt') || el.getAttribute('aria-label') || el.getAttribute('title') || '',
+        cls: typeof el.className === 'string' ? el.className : (el.getAttribute('class') || ''),
+      })),
+      scripts: [...document.scripts].map(s => s.src).filter(Boolean),
+      iframes: [...document.querySelectorAll('iframe')].map(f => abs(f.getAttribute('src'))).filter(Boolean),
+      forms: [...document.forms].slice(0, 20).map(f => ({
+        action: abs(f.getAttribute('action')),
+        method: (f.getAttribute('method') || 'get').toLowerCase(),
+        fields: [...f.querySelectorAll('input, select, textarea')]
+          .filter(x => (x as HTMLInputElement).type !== 'hidden')
+          .slice(0, 40)
+          .map(x => ({
+            name: x.getAttribute('name') || x.getAttribute('id') || '',
+            type: x.tagName === 'INPUT' ? (x as HTMLInputElement).type : x.tagName.toLowerCase(),
+            label: labelFor(x),
+            required: (x as HTMLInputElement).required,
+            ...(x.tagName === 'SELECT' ? { options: [...(x as HTMLSelectElement).options].slice(0, 30).map(op => op.text.trim()) } : {}),
+          })),
+      })),
+      links: [...document.querySelectorAll('a[href]')].slice(0, 1500).map(a => ({
+        text: (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+        href: abs(a.getAttribute('href')),
+      })).filter(l => l.href.startsWith('http')),
+    };
+  });
+  return { url, status, requestUrls: requests, ...data };
+}
+
+async function scrape(page: Page, o: Opts): Promise<Array<Record<string, string>>> {
+  const specs = o.fields.map(parseFieldSpec);
+  const rows: Array<Record<string, string>> = [];
+  for (let n = 1; n <= o.maxPages; n++) {
+    const pageRows = await page.evaluate(({ item, specs }) => {
+      const read = (el: Element | null, attr: string | null) => {
+        if (!el) return '';
+        if (attr) {
+          const v = el.getAttribute(attr) || '';
+          return (attr === 'href' || attr === 'src') && v ? new URL(v, location.href).href : v;
+        }
+        return ((el as HTMLElement).innerText ?? el.textContent ?? '').replace(/\s+/g, ' ').trim();
+      };
+      if (item) {
+        return [...document.querySelectorAll(item)].map(it => {
+          const r: Record<string, string> = {};
+          for (const s of specs) r[s.name] = read(it.matches(s.selector) ? it : it.querySelector(s.selector), s.attr);
+          return r;
+        });
+      }
+      const cols = specs.map(s => [...document.querySelectorAll(s.selector)].map(el => read(el, s.attr)));
+      const len = Math.max(0, ...cols.map(c => c.length));
+      return Array.from({ length: len }, (_, i) => Object.fromEntries(specs.map((s, j) => [s.name, cols[j][i] ?? ''])));
+    }, { item: o.item, specs });
+    for (const r of pageRows) rows.push({ page: String(n), ...r });
+    console.error(`page ${n}: ${pageRows.length} rows (${page.url()})`);
+
+    if (!o.next || n === o.maxPages) break;
+    const next = page.locator(o.next).first();
+    if (!(await next.count()) || !(await next.isVisible().catch(() => false))) break;
+    const before = page.url();
+    const firstBefore = await page.evaluate(() => document.body.innerText.slice(0, 500));
+    await next.click({ timeout: 10000 }).catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(o.wait);
+    const firstAfter = await page.evaluate(() => document.body.innerText.slice(0, 500));
+    if (page.url() === before && firstAfter === firstBefore) break; // next did nothing
+  }
+  return rows;
+}
+
+function emit(o: Opts, body: string): void {
+  if (o.out) {
+    writeFileSync(o.out, body);
+    console.error(`wrote ${o.out}`);
+  } else {
+    process.stdout.write(body.endsWith('\n') ? body : body + '\n');
+  }
+}
+
+async function main(): Promise<void> {
+  const o = parseArgs(process.argv.slice(2));
+  const { browser, page, status, requests } = await openPage(o);
+  try {
+    if (o.mode === 'scrape') {
+      emit(o, toCsv(await scrape(page, o)));
+    } else if (o.mode === 'text') {
+      const s = await snapshot(page, o.url, status, requests);
+      emit(o, `# ${s.title}\n${s.finalUrl}\n\n${s.text}`);
+    } else {
+      const report = analyzeSnapshot(await snapshot(page, o.url, status, requests));
+      emit(o, o.json ? JSON.stringify(report, null, 2) : formatReport(report));
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+await main();
